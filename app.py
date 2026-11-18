@@ -21,7 +21,13 @@ REQUIRED = ["Company", "Role", "Date Applied", "Status", "AI Fit Score", "Last U
 OPTIONAL = [
     "Posted Date", "Application Deadline", "Applicant Count",
     "Application Method", "Connection Level", "Furthest Stage",
+    "Resume Version", "Cover Letter", "Follow-up Sent", "Role Type",
 ]
+YES_NO_COLS = ["Cover Letter", "Follow-up Sent"]
+ROLE_TYPES = ["Data / Analytics", "Business Analysis", "Operations / Strategy",
+              "Project Coordination", "Finance", "Sales / Revenue", "Other"]
+# AI Fit Score buckets (edges are the lowest score in each bucket)
+SCORE_BINS = [(0, "Under 60"), (60, "60-74"), (75, "75+")]
 
 FACTORS = [
     ("Connection Level", ["None", "Know someone there", "Referral submitted",
@@ -29,8 +35,15 @@ FACTORS = [
     ("Application Method", ["LinkedIn", "Indeed", "Company Site", "Direct Email", "School Portal", "Other", "Undefined"]),
     ("Applicant Count", ["<25", "Under 25", "25-100", "100+", ">100", "Undefined"]),
     ("Posting Age", ["0-2 days", "3-7 days", "8+ days", "Undefined"]),
-    ("Score Bucket", ["Under 80", "80-89", "90+", "Undefined"]),
+    ("Score Bucket", [label for _, label in SCORE_BINS] + ["Undefined"]),
+    ("Role Type", ROLE_TYPES + ["Undefined"]),
+    ("Resume Version", ["Undefined"]),
+    ("Cover Letter", ["Yes", "No", "Undefined"]),
+    ("Follow-up Sent", ["Yes", "No", "Undefined"]),
 ]
+# factors you choose yourself, as opposed to context you can only pick around
+LEVERS = {"Application Method", "Connection Level", "Posting Age", "Resume Version", "Role Type",
+          "Cover Letter", "Follow-up Sent"}
 LABELS = {"Posting Age": "Days between posting and applying", "Score Bucket": "AI Fit Score"}
 METRICS = {
     "Interview rate": ["Interview", "Offer"],
@@ -56,6 +69,19 @@ def clean_text(series):
     return series.astype("string").str.strip().fillna("")
 
 
+def score_bucket(scores):
+    edges = [-1] + [low - 0.01 for low, _ in SCORE_BINS[1:]] + [100]
+    return (pd.cut(scores, bins=edges, labels=[label for _, label in SCORE_BINS])
+            .astype("string").fillna("Undefined"))
+
+
+def yes_no(series):
+    """Maps Y / yes / TRUE / x / 1 to Yes and N / no / FALSE / 0 to No; anything else stays as typed."""
+    low = series.str.lower()
+    out = series.where(~low.isin(["y", "yes", "true", "x", "1", "sent"]), "Yes")
+    return out.where(~low.isin(["n", "no", "false", "0"]), "No")
+
+
 def parse_dates(series):
     """Accepts 2026-10-04, 10/3/2026, and 10/3/2026 16:30:00 in the same column."""
     try:
@@ -75,12 +101,16 @@ def prepare(raw):
 
     df = df[clean_text(df["Company"]) != ""].copy()
 
-    for col in ["Company", "Role", "Status", "Applicant Count",
-                "Application Method", "Connection Level", "Furthest Stage"]:
+    for col in ["Company", "Role", "Status", "Applicant Count", "Application Method",
+                "Connection Level", "Furthest Stage", "Resume Version", "Cover Letter",
+                "Follow-up Sent", "Role Type"]:
         df[col] = clean_text(df[col])
     df["Status"] = df["Status"].replace({"Job Offer": "Offer"})
+    for col in YES_NO_COLS:
+        df[col] = yes_no(df[col])
 
-    for col in ["Applicant Count", "Application Method", "Connection Level"]:
+    for col in ["Applicant Count", "Application Method", "Connection Level",
+                "Resume Version", "Cover Letter", "Follow-up Sent", "Role Type"]:
         blank = df[col].str.lower().isin(["", "unknown", "undefined"])
         df[col] = df[col].where(~blank, "Undefined")
 
@@ -113,10 +143,7 @@ def prepare(raw):
         pd.cut(gap, bins=[-10000, 2, 7, 10000], labels=["0-2 days", "3-7 days", "8+ days"])
         .astype("string").fillna("Undefined")
     )
-    df["Score Bucket"] = (
-        pd.cut(df["AI Fit Score"], bins=[-1, 79.99, 89.99, 100], labels=["Under 80", "80-89", "90+"])
-        .astype("string").fillna("Undefined")
-    )
+    df["Score Bucket"] = score_bucket(df["AI Fit Score"])
     return df
 
 
@@ -185,6 +212,7 @@ def factor_ranking(df, metric):
             n, k, rate = rate_row(resolved[resolved[col] == group], metric)
             rows.append({
                 "Factor": LABELS.get(col, col),
+                "You control it": "Yes" if col in LEVERS else "No",
                 "Option": group,
                 "Resolved": n,
                 f"{metric} %": rate,
@@ -211,7 +239,7 @@ def factor_takeaways(table, metric):
         best, worst = sub.iloc[0], sub.iloc[-1]
         gap = best[f"{metric} %"] - worst[f"{metric} %"]
         weakest = confidence_label(min(best["Resolved"], worst["Resolved"]))
-        found.append((gap, factor, best, worst, weakest))
+        found.append((gap, factor, best, worst, weakest, best["You control it"] == "Yes"))
     found.sort(key=lambda t: t[0], reverse=True)
     return found, skipped
 
@@ -291,9 +319,10 @@ else:
     takeaways, skipped = factor_takeaways(ranking, metric)
     if takeaways:
         st.markdown("**Biggest differences so far**")
-        for gap, factor, best, worst, conf in takeaways:
+        for gap, factor, best, worst, conf, lever in takeaways:
+            tag = " (you control this)" if lever else ""
             st.markdown(
-                f"- **{factor}**: *{best['Option']}* {best[f'{metric} %']}% ({best['Hits']}) vs "
+                f"- **{factor}**{tag}: *{best['Option']}* {best[f'{metric} %']}% ({best['Hits']}) vs "
                 f"*{worst['Option']}* {worst[f'{metric} %']}% ({worst['Hits']}), "
                 f"a {gap:.0f}-point gap. Confidence: {conf}."
             )
@@ -311,7 +340,11 @@ p1, p2, p3, p4 = st.columns(4)
 method_choice = p1.selectbox("Application method", choices(df, "Application Method", FACTORS[1][1]))
 conn_choice = p2.selectbox("Connection level", choices(df, "Connection Level", FACTORS[0][1]))
 count_choice = p3.selectbox("Applicant count", ["Any"] + choices(df, "Applicant Count", FACTORS[2][1]))
-score_choice = p4.number_input("AI Fit Score", min_value=0, max_value=100, value=85, step=1)
+score_choice = p4.number_input("AI Fit Score", min_value=0, max_value=100, value=70, step=1)
+q1, q2, q3 = st.columns(3)
+role_choice = q1.selectbox("Role type", ["Any"] + choices(df, "Role Type", ROLE_TYPES))
+resume_choice = q2.selectbox("Resume version", ["Any"] + choices(df, "Resume Version", []))
+cover_choice = q3.selectbox("Cover letter", ["Any", "Yes", "No"])
 
 basis, similar = similar_applications(df, method_choice, conn_choice, score_choice, count_choice)
 similar_resolved = similar[similar["Outcome"] != "Pending"]
@@ -339,12 +372,13 @@ elif n_sim:
 
 with st.expander("Each choice on its own"):
     resolved_all = df[df["Outcome"] != "Pending"]
-    picked_bucket = pd.cut(pd.Series([score_choice]), bins=[-1, 79.99, 89.99, 100],
-                           labels=["Under 80", "80-89", "90+"]).astype(str)[0]
+    picked_bucket = score_bucket(pd.Series([score_choice]))[0]
     picks = [("Application Method", method_choice), ("Connection Level", conn_choice),
              ("Score Bucket", picked_bucket)]
-    if count_choice != "Any":
-        picks.append(("Applicant Count", count_choice))
+    for col, value in [("Applicant Count", count_choice), ("Role Type", role_choice),
+                       ("Resume Version", resume_choice), ("Cover Letter", cover_choice)]:
+        if value != "Any":
+            picks.append((col, value))
     rows = []
     for col, value in picks:
         sub = resolved_all[resolved_all[col] == value]
@@ -359,7 +393,8 @@ with st.expander(f"The {len(similar)} similar applications"):
     show = similar.sort_values("Date Applied", ascending=False).copy()
     show["Date Applied"] = show["Date Applied"].dt.date
     st.dataframe(show[["Company", "Role", "Date Applied", "Outcome", "AI Fit Score",
-                       "Application Method", "Connection Level", "Applicant Count"]],
+                       "Application Method", "Connection Level", "Applicant Count",
+                       "Role Type", "Resume Version", "Cover Letter"]],
                  hide_index=True, width="stretch")
 
 # ---------- 1. Status funnel ----------
@@ -391,7 +426,7 @@ scored = df[df["Score Bucket"] != "Undefined"]
 if len(scored) > 0:
     outcome_cols = ["Offer", "Interview", "Rejected", "Ghosted", "Pending"]
     counts = pd.crosstab(scored["Score Bucket"], scored["Outcome"]).reindex(columns=outcome_cols, fill_value=0)
-    counts = counts.reindex([b for b in ["Under 80", "80-89", "90+"] if b in counts.index])
+    counts = counts.reindex([b for _, b in SCORE_BINS if b in counts.index])
     fig3, ax3 = plt.subplots(figsize=(7, 4))
     counts.plot(
         kind="bar", stacked=True, ax=ax3,
@@ -411,7 +446,8 @@ st.caption(
     "Response rate = share of resolved applications that got any reply (rejection, interview, or offer). "
     f"Ghosted = no reply {GHOST_DAYS_AFTER_DEADLINE} days after the deadline "
     f"(or {GHOST_DAYS_NO_DEADLINE} days after applying when no deadline is listed). "
-    "Pending applications are excluded from the rates. Check the counts before the percentages."
+    "Pending applications are excluded from the rates. Check the counts before the percentages. "
+    "Follow-up Sent leans optimistic: you can only follow up on applications that were still open."
 )
 
 for col, preferred in FACTORS:
